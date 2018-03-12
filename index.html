@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<style>
+
+.line {
+  fill: none;
+  shape-rendering: auto;
+  stroke-width: 2px;
+}
+
+.svg-container {
+  display: inline-block;
+  position: relative;
+  width: 100%;
+  padding-bottom: 100%; /* aspect ratio */
+  vertical-align: top;
+  /*overflow: hidden;*/
+}
+
+.svg-content {
+  display: inline-block;
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.legend-text {
+  font-size: 10px;
+}
+
+.focus-rect {
+  fill: none;
+  stroke: none;
+  pointer-events: all;
+}
+
+.focus-line {
+  /*display: none;*/
+  width: 0.5px;
+  height: 100%;
+  fill: black;
+}
+
+circle {
+    /*fill: #ffab00;*/
+    stroke: #fff;
+}
+
+</style>
+
+
+<body>
+
+  <div class="svg-container"></div>
+
+  <script src="https://d3js.org/d3.v4.min.js"></script>
+  <script src="fetcher.js"></script>
+
+  <script>
+
+    // https://stackoverflow.com/questions/901115/how-can-i-get-query-string-values-in-javascript
+    function queryParameter(name) {
+      let url = window.location.href;
+      name = name.replace(/[\[\]]/g, "\\$&");
+      let regex = new RegExp("[?&]" + name + "(=([^&#]*)|&|#|$)"),
+          results = regex.exec(url);
+      if (!results || !results[2]) {
+        return "";
+      }
+      return decodeURIComponent(results[2].replace(/\+/g, " "));
+    }
+
+    // https://github.com/darkskyapp/string-hash/blob/master/index.js
+    function stringHash(s) {
+      var hash = 5381, i = s.length;
+
+      while(i) {
+        hash = (hash * 33) ^ s.charCodeAt(--i);
+      }
+
+      return hash >>> 0;
+    }
+
+    var prometheusUrl = queryParameter('prometheus-url') || "http://prometheus.corp.smarkets.com:9090";
+    var samplingInterval = +(queryParameter('sampling-interval') || '10');
+    var samplesInBucket = +(queryParameter('samples-in-bucket') || '1');
+    var queryInterval = +(queryParameter('query-interval') || '3600');
+    var aggregationType = queryParameter('aggregation-type') || 'avg';
+    var refreshInterval = +(queryParameter('refresh-interval') || '60');
+    var query = queryParameter('query');
+    var query = 'avg(100-irate(system_cpu{team="infrastructure",value="idle",purpose=~".*prometheus.*"}[30s]))by(host)';
+    var drawPoints = (queryParameter('draw-points') || 'true') === 'true';
+    var curveType = queryParameter('curve-type') || 'linear';
+    // 'avg(100-irate(system_cpu{team="infrastructure",value="idle",purpose=~".*prometheus.*"}[30s]))by(host)'
+
+    // https://github.com/d3/d3/blob/master/API.md
+    // https://d3js.org/
+    // https://bl.ocks.org/d3noob/402dd382a51a4f6eea487f9a35566de0
+
+    var margin = {top: 20, right: 20, bottom: 30, left: 40},
+        width = 600 - margin.left - margin.right,
+        height = 400 - margin.top - margin.bottom;
+
+    var x = d3.scaleTime().range([0, width]);
+    var y = d3.scaleLinear().range([height, 0]);
+
+    var svg = d3.select("div.svg-container")
+      .append("svg")
+        //responsive SVG needs these 2 attributes and no width and height attr
+        .attr("preserveAspectRatio", "xMinYMin meet")
+        .attr("viewBox", "0 0 600 400")
+        .classed("svg-content", true)
+      .append("g")
+        .attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+
+    // var focusRectangle = svg.append("rect")
+    //       .classed("focus-rect", true)
+    //       .attr("width", "100%")
+    //       .attr("height", "100%");
+
+    // var focusLine = svg.append('rect').classed("focus-line", true).attr("x", 20).style('display', 'none');
+
+    function bucketAggregate(bucket, v) {
+      return {d: new Date(bucket.pop().t), v: v};
+    }
+
+    function bucketAggregateSum(bucket) {
+      return (bucket == undefined || bucket.length < 1) ? undefined : bucketAggregate(bucket, d3.sum(bucket, d => d.v));
+    }
+
+    function bucketAggregateMax(bucket) {
+      return (bucket == undefined || bucket.length < 1) ? undefined : bucketAggregate(bucket, d3.max(bucket, d => d.v));
+    }
+
+    function bucketAggregateMin(bucket) {
+      return (bucket == undefined || bucket.length < 1) ? undefined : bucketAggregate(bucket, d3.min(bucket, d => d.v));
+    }
+
+    function bucketAggregateAvg(bucket) {
+      return (bucket == undefined || bucket.length < 1) ? undefined : bucketAggregate(bucket, d3.mean(bucket, d => d.v));
+    }
+
+    function bucketAggregateMedian(bucket) {
+      return (bucket == undefined || bucket.length < 1) ? undefined : bucketAggregate(bucket, d3.median(bucket, d => d.v));
+    }
+
+    function bucketAggregateRandom(bucket) {
+      if (bucket == undefined || bucket.length < 1) return undefined;
+      let i = d3.randomUniform(bucket.length)();
+      return bucketAggregate(bucket, bucket[i].v);
+    }
+
+    function bucketAggregateFirst(bucket) {
+      return (bucket == undefined || bucket.length < 1) ? undefined : bucketAggregate(bucket, bucket[0].v);
+    }
+
+    function bucketAggregateLast(bucket) {
+      return (bucket == undefined || bucket.length < 1) ? undefined : bucketAggregate(bucket, bucket[bucket.length - 1].v);
+    }
+
+    let bucketAggregations = {
+      sum: bucketAggregateSum,
+      max: bucketAggregateMax,
+      min: bucketAggregateMin,
+      avg: bucketAggregateAvg,
+      median: bucketAggregateMedian,
+      random: bucketAggregateRandom,
+      first: bucketAggregateFirst,
+      last: bucketAggregateLast
+    }
+
+    function findUpperTick(x) {
+      if (x === 0) {
+        return 0;
+      }
+
+      if (x < 0) {
+        for(var i = 30; i >= 0; i -= 1) {
+          var tick = -(10 ** i);
+          if (tick >= x) {
+            break;
+          }
+        }
+        if (tick < x) {
+          tick = 0;
+        }
+      } else {
+        for(var i = 0; i <= 30; i += 1) {
+          var tick = (10 ** i);
+          if (tick >= x) {
+            break;
+          }
+        }
+        if (tick < x) {
+          tick = 0;
+        }
+      }
+
+      return tick;
+    }
+
+    function findLowerTick(x) {
+      if (x === 0) {
+        return 0;
+      }
+
+      if (x < 0) {
+        for(var i = 0; i <= 30; i += 1) {
+          var tick = -(10 ** i);
+          if (tick <= x) {
+            break;
+          }
+        }
+        if (tick > x) {
+          tick = 0;
+        }
+      } else {
+        for(var i = 30; i >= 0; i -= 1) {
+          var tick = (10 ** i);
+          if (tick <= x) {
+            break;
+          }
+        }
+        if (tick > x) {
+          tick = 0;
+        }
+      }
+
+      return tick;
+    }
+
+    function normalizeExtent(extent) {
+      let lowerTick = findLowerTick(extent[0]);
+      let upperTick = findUpperTick(extent[1]);
+
+      if (lowerTick === 0 && upperTick === 0) {
+        return [0, 1];
+      }
+
+      if (upperTick > 0 && lowerTick > 0 && upperTick / lowerTick >= 10) {
+        return [0, upperTick];
+      }
+
+      if (upperTick < 0 && lowerTick < 0 && lowerTick / upperTick >= 10) {
+        return [lowerTick, 0];
+      }
+
+      return [lowerTick, upperTick];
+    }
+
+    let curveTypes = {
+      linear: d3.curveLinear,
+      cardinal: d3.curveCardinalOpen.tension(0.3)
+    }
+
+    function drawLines(metrics, startTimestamp, endTimestamp) {
+      let valueExtents = metrics.map(metric => d3.extent(metric.values, d => d != undefined ? d.v : undefined));
+      x.domain([startTimestamp, endTimestamp]);
+      y.domain(normalizeExtent(d3.extent(d3.merge(valueExtents))));
+
+      svg.selectAll("path").remove();
+      svg.selectAll("circle.path-circle").remove();
+      svg.selectAll("text.legend-text").remove();
+      svg.selectAll("rect.legend-rect").remove();
+
+      // Add the axes once x and y domains are set
+      svg.selectAll(".x-axis").remove();
+      svg.append("g")
+        .attr("transform", "translate(0," + height + ")")
+        .classed("x-axis", true)
+        .call(d3.axisBottom(x));
+      svg.selectAll(".y-axis").remove();
+      svg.append("g")
+        .classed("y-axis", true)
+        .call(d3.axisLeft(y));
+
+      // Coords for legend
+      var textX = 20, textY = -5;
+      var rectX = 10, rectY = -11;
+
+      for (let metric of metrics) {
+        let color = d3.schemeCategory20[metric.hash % d3.schemeCategory20.length];
+
+        let line = d3.line()
+                    .defined(d => d != undefined)
+                    .curve(curveTypes[curveType])
+                    .x(d => x(d.d))
+                    .y(d => y(d.v));
+
+        svg.append("path")
+          .datum(metric.values)
+          .attr("stroke", color)
+          .attr("class", "line")
+          .attr("d", line);
+
+        if (drawPoints) {
+          for (let d of metric.values.filter(d => d != undefined)) {
+            svg.append("circle")
+              .classed("path-circle", true)
+              .attr("cx", x(d.d))
+              .attr("cy", y(d.v))
+              .style("fill", color)
+              .attr("r", 3);
+          }
+        }
+      
+        svg.append("text")
+          .classed("legend-text", true)
+          .attr("x", textX)
+          .attr("y", textY += 15)
+          .text(metric.key);
+
+        svg.append("rect")
+          .classed("legend-rect", true)
+          .attr("rx", 2)
+          .attr("x", rectX)
+          .attr("y", rectY += 15)
+          .attr("width", 7)
+          .attr("height", 7)
+          .style("fill", color);
+      }
+      // const bisectDate = d3.bisector(d => d.t).left;
+
+      // svg.selectAll("rect.focus-rect")
+      //   .on('mouseover', () => focusLine.style('display', null))
+      //   .on('mouseout', () => focusLine.style('display', 'none'))
+      //   .on('mousemove', function() {
+      //       return;
+      //       var mouse = d3.mouse(this);
+      //       var mouseDate = x.invert(mouse[0]);
+      //       var i = bisectDate(metrics[0], mouseDate); // returns the index to the current data item
+
+      //       var d0 = data[i - 1]
+      //       var d1 = data[i];
+            // work out which date value is closest to the mouse
+            // var d = mouseDate - d0[0] > d1[0] - mouseDate ? d1 : d0;
+
+            // var x = xScale(d[0]);
+            // var y = yScale(d[1]);
+
+            // focus.select('#focusCircle')
+            //     .attr('cx', x)
+            //     .attr('cy', y);
+            // focus.select('#focusLineX')
+            //     .attr('x1', x).attr('y1', yScale(yDomain[0]))
+            //     .attr('x2', x).attr('y2', yScale(yDomain[1]));
+            // focus.select('#focusLineY')
+            //     .attr('x1', xScale(xDomain[0])).attr('y1', y)
+            //     .attr('x2', xScale(xDomain[1])).attr('y2', y);
+        // });
+    }
+
+    function parseAndDraw(data, startTimestamp, endTimestamp) {
+      const bucketDuration = samplesInBucket * samplingInterval;
+      const bucketThresholds = [];  // < x0 < x1 ... < xN
+      for(var t = endTimestamp - endTimestamp % bucketDuration; t > startTimestamp; t -= bucketDuration) {
+        bucketThresholds.unshift(t * 1000 + 1);
+      }
+
+      const metrics = [];
+      data.forEach((metricSamples, metricId) => {
+        const timestamps = Array.from(metricSamples.keys());
+        timestamps.sort();
+        const values = timestamps.map(t => {return {t: t, v: metricSamples.get(t)};});
+
+        let buckets = d3.histogram()
+            .value(d => d.t)
+            .thresholds(bucketThresholds)(values);
+        metrics.push({
+          key: metricId,
+          hash: stringHash(metricId),
+          values: buckets.map(bucketAggregations[aggregationType])
+        });
+      });
+
+      metrics.sort((a, b) => {
+        if (a.key > b.key) return 1;
+        if (a.key < b.key) return -1;
+        return 0;
+      });
+      drawLines(metrics, new Date(startTimestamp * 1000), new Date(endTimestamp * 1000));
+    }
+
+    const prometheusFetcher = new PrometheusFetcher([prometheusUrl]);
+    const queryCache = new QueryCache(prometheusFetcher, query, 1000 * samplingInterval);
+
+    function queryPrometheus() {
+      // Prometheus wants Unix timestamps in seconds (or ISO)
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const endSeconds = nowSeconds - nowSeconds % samplingInterval;
+      // TODO: queryInterval must be sanitized
+      const startSeconds = endSeconds - queryInterval;
+
+      queryCache.get(startSeconds * 1000, endSeconds * 1000, data => parseAndDraw(data, startSeconds, endSeconds));
+
+      // var url = prometheusUrl + "/api/v1/query_range";
+      // url += '?start=' + encodeURIComponent('' + startTimestamp);
+      // url += '&end=' + encodeURIComponent('' + endTimestamp);
+      // url += '&query=' + encodeURIComponent('' + query);
+      // url += '&step=' + encodeURIComponent('' + samplingInterval + 's');
+
+      // d3.json(url, data => data && data.status === "success" && parseAndDraw(data, startTimestamp, endTimestamp))
+    }
+
+    if (refreshInterval > 0) {
+      window.setInterval(queryPrometheus, refreshInterval * 1000);
+    }
+
+    queryPrometheus();
+
+</script>
+
+</body>
